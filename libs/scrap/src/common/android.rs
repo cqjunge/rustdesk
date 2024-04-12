@@ -1,5 +1,5 @@
 use crate::android::ffi::*;
-use crate::Pixfmt;
+use crate::{Frame, Pixfmt};
 use lazy_static::lazy_static;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -43,30 +43,49 @@ impl crate::TraitCapturer for Capturer {
             unsafe {
                 std::ptr::copy_nonoverlapping(buf.as_ptr(), self.rgba.as_mut_ptr(), buf.len())
             };
-            Ok(Frame::new(&self.rgba, self.height()))
+            Ok(Frame::PixelBuffer(PixelBuffer::new(
+                &self.rgba,
+                self.width(),
+                self.height(),
+            )))
         } else {
             return Err(io::ErrorKind::WouldBlock.into());
         }
     }
 }
 
-pub struct Frame<'a> {
-    pub data: &'a [u8],
-    pub stride: Vec<usize>,
+pub struct PixelBuffer<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    stride: Vec<usize>,
 }
 
-impl<'a> Frame<'a> {
-    pub fn new(data: &'a [u8], h: usize) -> Self {
-        let stride = data.len() / h;
-        let mut v = Vec::new();
-        v.push(stride);
-        Frame { data, stride: v }
+impl<'a> PixelBuffer<'a> {
+    pub fn new(data: &'a [u8], width: usize, height: usize) -> Self {
+        let stride0 = data.len() / height;
+        let mut stride = Vec::new();
+        stride.push(stride0);
+        PixelBuffer {
+            data,
+            width,
+            height,
+            stride,
+        }
     }
 }
 
-impl<'a> crate::TraitFrame for Frame<'a> {
+impl<'a> crate::TraitPixelBuffer for PixelBuffer<'a> {
     fn data(&self) -> &[u8] {
         self.data
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
     }
 
     fn stride(&self) -> Vec<usize> {

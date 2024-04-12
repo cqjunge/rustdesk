@@ -1,12 +1,16 @@
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::common::get_default_sound_input;
 use crate::{
     client::file_trait::FileManager,
-    common::is_keyboard_mode_supported,
-    common::make_fd_to_json,
-    flutter::{self, session_add, session_add_existed, session_start_, sessions},
+    common::{is_keyboard_mode_supported, make_fd_to_json},
+    flutter::{
+        self, session_add, session_add_existed, session_start_, sessions, try_sync_peer_option,
+    },
     input::*,
     ui_interface::{self, *},
+};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::{
+    common::get_default_sound_input,
+    keyboard::input_source::{change_input_source, get_cur_session_input_source},
 };
 use flutter_rust_bridge::{StreamSink, SyncReturn};
 #[cfg(feature = "plugin_framework")]
@@ -36,7 +40,10 @@ lazy_static::lazy_static! {
 }
 
 fn initialize(app_dir: &str) {
+    flutter::async_tasks::start_flutter_async_runner();
     *config::APP_DIR.write().unwrap() = app_dir.to_owned();
+    // core_main's load_custom_client does not work for flutter since it is only applied to its load_library in main.c
+    crate::load_custom_client();
     #[cfg(target_os = "android")]
     {
         // flexi_logger can't work when android_logger initialized.
@@ -59,6 +66,11 @@ fn initialize(app_dir: &str) {
         use hbb_common::env_logger::*;
         init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "debug"));
     }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // core_main's init_log does not work for flutter since it is only applied to its load_library in main.c
+        hbb_common::init_log(false, "flutter_ffi");
+    }
 }
 
 #[inline]
@@ -73,6 +85,7 @@ pub fn stop_global_event_stream(app_type: String) {
 pub enum EventToUI {
     Event(String),
     Rgba(usize),
+    Texture(usize),
 }
 
 pub fn host_stop_system_key_propagate(_stopped: bool) {
@@ -109,6 +122,7 @@ pub fn session_add_sync(
     switch_uuid: String,
     force_relay: bool,
     password: String,
+    is_shared_password: bool,
 ) -> SyncReturn<String> {
     if let Err(e) = session_add(
         &session_id,
@@ -119,6 +133,7 @@ pub fn session_add_sync(
         &switch_uuid,
         force_relay,
         password,
+        is_shared_password,
     ) {
         SyncReturn(format!("Failed to add session with id {}, {}", &id, e))
     } else {
@@ -175,6 +190,12 @@ pub fn session_login(
     }
 }
 
+pub fn session_send2fa(session_id: SessionID, code: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send2fa(code);
+    }
+}
+
 pub fn session_close(session_id: SessionID) {
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         session.close_event_stream(session_id);
@@ -217,10 +238,17 @@ pub fn session_toggle_option(session_id: SessionID, value: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         log::warn!("toggle option {}", &value);
         session.toggle_option(value.clone());
+        try_sync_peer_option(&session, &session_id, &value, None);
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if sessions::get_session_by_session_id(&session_id).is_some() && value == "disable-clipboard" {
         crate::flutter::update_text_clipboard_required();
+    }
+}
+
+pub fn session_toggle_privacy_mode(session_id: SessionID, impl_key: String, on: bool) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.toggle_privacy_mode(impl_key, on);
     }
 }
 
@@ -323,6 +351,7 @@ pub fn session_set_keyboard_mode(session_id: SessionID, value: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.save_keyboard_mode(value.clone());
         _mode_updated = true;
+        try_sync_peer_option(&session, &session_id, "keyboard_mode", None);
     }
     #[cfg(windows)]
     if _mode_updated {
@@ -330,12 +359,13 @@ pub fn session_set_keyboard_mode(session_id: SessionID, value: String) {
     }
 }
 
-pub fn session_get_reverse_mouse_wheel(session_id: SessionID) -> Option<String> {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+pub fn session_get_reverse_mouse_wheel_sync(session_id: SessionID) -> SyncReturn<Option<String>> {
+    let res = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         Some(session.get_reverse_mouse_wheel())
     } else {
         None
-    }
+    };
+    SyncReturn(res)
 }
 
 pub fn session_set_reverse_mouse_wheel(session_id: SessionID, value: String) {
@@ -395,6 +425,7 @@ pub fn session_is_keyboard_mode_supported(session_id: SessionID, mode: String) -
             SyncReturn(is_keyboard_mode_supported(
                 &mode,
                 session.get_peer_version(),
+                &session.peer_platform(),
             ))
         } else {
             SyncReturn(false)
@@ -428,14 +459,8 @@ pub fn session_ctrl_alt_del(session_id: SessionID) {
     }
 }
 
-pub fn session_switch_display(session_id: SessionID, value: Vec<i32>) {
-    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        if value.len() == 1 {
-            session.switch_display(value[0]);
-        } else {
-            session.capture_displays(vec![], vec![], value);
-        }
-    }
+pub fn session_switch_display(is_desktop: bool, session_id: SessionID, value: Vec<i32>) {
+    sessions::session_switch_display(is_desktop, session_id, value);
 }
 
 pub fn session_handle_flutter_key_event(
@@ -688,6 +713,12 @@ pub fn session_set_size(_session_id: SessionID, _display: usize, _width: usize, 
     super::flutter::session_set_size(_session_id, _display, _width, _height)
 }
 
+pub fn session_send_selected_session_id(session_id: SessionID, sid: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send_selected_session_id(sid);
+    }
+}
+
 pub fn main_get_sound_inputs() -> Vec<String> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     return get_sound_inputs();
@@ -782,6 +813,10 @@ pub fn main_get_app_name_sync() -> SyncReturn<String> {
     SyncReturn(get_app_name())
 }
 
+pub fn main_uri_prefix_sync() -> SyncReturn<String> {
+    SyncReturn(crate::get_uri_prefix())
+}
+
 pub fn main_get_license() -> String {
     get_license()
 }
@@ -828,7 +863,7 @@ pub fn main_check_connect_status() {
 }
 
 pub fn main_is_using_public_server() -> bool {
-    using_public_server()
+    crate::using_public_server()
 }
 
 pub fn main_discover() {
@@ -839,6 +874,7 @@ pub fn main_get_api_server() -> String {
     get_api_server()
 }
 
+// This function doesn't seem to be used.
 pub fn main_post_request(url: String, body: String, header: String) {
     post_request(url, body, header)
 }
@@ -853,6 +889,24 @@ pub fn main_get_env(key: String) -> SyncReturn<String> {
 
 pub fn main_set_local_option(key: String, value: String) {
     set_local_option(key, value)
+}
+
+pub fn main_get_input_source() -> SyncReturn<String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let input_source = get_cur_session_input_source();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let input_source = "".to_owned();
+    SyncReturn(input_source)
+}
+
+pub fn main_set_input_source(session_id: SessionID, value: String) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        change_input_source(session_id, value);
+        if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+            try_sync_peer_option(&session, &session_id, "input_source", None);
+        }
+    }
 }
 
 pub fn main_get_my_id() -> String {
@@ -965,14 +1019,6 @@ pub fn main_load_lan_peers_sync() -> SyncReturn<String> {
         ),
     ]);
     return SyncReturn(serde_json::ser::to_string(&data).unwrap_or("".to_owned()));
-}
-
-pub fn main_load_ab_sync() -> SyncReturn<String> {
-    return SyncReturn(serde_json::to_string(&config::Ab::load()).unwrap_or_default());
-}
-
-pub fn main_load_group_sync() -> SyncReturn<String> {
-    return SyncReturn(serde_json::to_string(&config::Group::load()).unwrap_or_default());
 }
 
 pub fn main_load_recent_peers_for_ab(filter: String) -> String {
@@ -1094,7 +1140,7 @@ pub fn main_get_user_default_option(key: String) -> SyncReturn<String> {
 }
 
 pub fn main_handle_relay_id(id: String) -> String {
-    handle_relay_id(id)
+    handle_relay_id(&id).to_owned()
 }
 
 pub fn main_get_main_display() -> SyncReturn<String> {
@@ -1247,6 +1293,10 @@ pub fn main_remove_peer(id: String) {
 
 pub fn main_has_hwcodec() -> SyncReturn<bool> {
     SyncReturn(has_hwcodec())
+}
+
+pub fn main_has_gpucodec() -> SyncReturn<bool> {
+    SyncReturn(has_gpucodec())
 }
 
 pub fn main_supported_hwdecodings() -> SyncReturn<String> {
@@ -1534,20 +1584,23 @@ pub fn cm_switch_back(conn_id: i32) {
     crate::ui_cm_interface::switch_back(conn_id);
 }
 
-pub fn main_get_build_date() -> String {
-    crate::BUILD_DATE.to_string()
+pub fn cm_get_config(name: String) -> String {
+    #[cfg(not(target_os = "ios"))]
+    {
+        if let Ok(Some(v)) = crate::ipc::get_config(&name) {
+            v
+        } else {
+            "".to_string()
+        }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        "".to_string()
+    }
 }
 
-fn handle_query_onlines(onlines: Vec<String>, offlines: Vec<String>) {
-    let data = HashMap::from([
-        ("name", "callback_query_onlines".to_owned()),
-        ("onlines", onlines.join(",")),
-        ("offlines", offlines.join(",")),
-    ]);
-    let _res = flutter::push_global_event(
-        flutter::APP_TYPE_MAIN,
-        serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
-    );
+pub fn main_get_build_date() -> String {
+    crate::BUILD_DATE.to_string()
 }
 
 pub fn translate(name: String, locale: String) -> SyncReturn<String> {
@@ -1562,19 +1615,28 @@ pub fn session_next_rgba(session_id: SessionID, display: usize) -> SyncReturn<()
     SyncReturn(super::flutter::session_next_rgba(session_id, display))
 }
 
-pub fn session_register_texture(
+pub fn session_register_pixelbuffer_texture(
     session_id: SessionID,
     display: usize,
     ptr: usize,
 ) -> SyncReturn<()> {
-    SyncReturn(super::flutter::session_register_texture(
+    SyncReturn(super::flutter::session_register_pixelbuffer_texture(
+        session_id, display, ptr,
+    ))
+}
+
+pub fn session_register_gpu_texture(
+    session_id: SessionID,
+    display: usize,
+    ptr: usize,
+) -> SyncReturn<()> {
+    SyncReturn(super::flutter::session_register_gpu_texture(
         session_id, display, ptr,
     ))
 }
 
 pub fn query_onlines(ids: Vec<String>) {
-    #[cfg(not(any(target_os = "ios")))]
-    crate::rendezvous_mediator::query_online_states(ids, handle_query_onlines)
+    let _ = flutter::async_tasks::query_onlines(ids);
 }
 
 pub fn version_to_number(v: String) -> SyncReturn<i64> {
@@ -1589,16 +1651,10 @@ pub fn main_is_installed() -> SyncReturn<bool> {
     SyncReturn(is_installed())
 }
 
-pub fn main_start_grab_keyboard() -> SyncReturn<bool> {
-    #[cfg(target_os = "linux")]
-    if !crate::platform::linux::is_x11() {
-        return SyncReturn(false);
-    }
-    crate::keyboard::client::start_grab_loop();
-    if !is_can_input_monitoring(false) {
-        return SyncReturn(false);
-    }
-    SyncReturn(true)
+pub fn main_init_input_source() -> SyncReturn<()> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::keyboard::input_source::init_input_source();
+    SyncReturn(())
 }
 
 pub fn main_is_installed_lower_version() -> SyncReturn<bool> {
@@ -1623,10 +1679,6 @@ pub fn main_is_can_input_monitoring(prompt: bool) -> SyncReturn<bool> {
 
 pub fn main_is_share_rdp() -> SyncReturn<bool> {
     SyncReturn(is_share_rdp())
-}
-
-pub fn main_is_rdp_service_open() -> SyncReturn<bool> {
-    SyncReturn(is_rdp_service_open())
 }
 
 pub fn main_set_share_rdp(enable: bool) {
@@ -1714,15 +1766,8 @@ pub fn main_hide_docker() -> SyncReturn<bool> {
     SyncReturn(true)
 }
 
-pub fn main_use_texture_render() -> SyncReturn<bool> {
-    #[cfg(not(feature = "flutter_texture_render"))]
-    {
-        SyncReturn(false)
-    }
-    #[cfg(feature = "flutter_texture_render")]
-    {
-        SyncReturn(true)
-    }
+pub fn main_has_pixelbuffer_texture_render() -> SyncReturn<bool> {
+    SyncReturn(cfg!(feature = "flutter_texture_render"))
 }
 
 pub fn main_has_file_clipboard() -> SyncReturn<bool> {
@@ -1734,6 +1779,10 @@ pub fn main_has_file_clipboard() -> SyncReturn<bool> {
         )
     ));
     SyncReturn(ret)
+}
+
+pub fn main_has_gpu_texture_render() -> SyncReturn<bool> {
+    SyncReturn(cfg!(feature = "gpucodec"))
 }
 
 pub fn cm_init() {
@@ -1757,13 +1806,55 @@ pub fn main_test_wallpaper(_second: u64) {
             std::thread::sleep(std::time::Duration::from_secs(_second));
         }
         Err(e) => {
-            log::info!("create wallpaper remover failed:{:?}", e);
+            log::info!("create wallpaper remover failed: {:?}", e);
         }
     });
 }
 
 pub fn main_support_remove_wallpaper() -> bool {
     support_remove_wallpaper()
+}
+
+pub fn is_incoming_only() -> SyncReturn<bool> {
+    SyncReturn(config::is_incoming_only())
+}
+
+pub fn is_outgoing_only() -> SyncReturn<bool> {
+    SyncReturn(config::is_outgoing_only())
+}
+
+pub fn is_custom_client() -> SyncReturn<bool> {
+    SyncReturn(get_app_name() != "RustDesk")
+}
+
+pub fn is_disable_settings() -> SyncReturn<bool> {
+    SyncReturn(config::is_disable_settings())
+}
+
+pub fn is_disable_ab() -> SyncReturn<bool> {
+    SyncReturn(config::is_disable_ab())
+}
+
+pub fn is_disable_account() -> SyncReturn<bool> {
+    SyncReturn(config::is_disable_account())
+}
+
+// windows only
+pub fn is_disable_installation() -> SyncReturn<bool> {
+    SyncReturn(config::is_disable_installation())
+}
+
+pub fn is_preset_password() -> bool {
+    config::HARD_SETTINGS
+        .read()
+        .unwrap()
+        .get("password")
+        .map_or(false, |p| {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            return p == &crate::ipc::get_permanent_password();
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            return p == &config::Config::get_permanent_password();
+        })
 }
 
 /// Send a url scheme throught the ipc.
@@ -1962,6 +2053,47 @@ pub fn is_selinux_enforcing() -> SyncReturn<bool> {
     {
         SyncReturn(false)
     }
+}
+
+pub fn main_default_privacy_mode_impl() -> SyncReturn<String> {
+    SyncReturn(crate::privacy_mode::DEFAULT_PRIVACY_MODE_IMPL.to_owned())
+}
+
+pub fn main_supported_privacy_mode_impls() -> SyncReturn<String> {
+    SyncReturn(
+        serde_json::to_string(&crate::privacy_mode::get_supported_privacy_mode_impl())
+            .unwrap_or_default(),
+    )
+}
+
+pub fn main_supported_input_source() -> SyncReturn<String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        SyncReturn("".to_owned())
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(
+            serde_json::to_string(&crate::keyboard::input_source::get_supported_input_source())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+pub fn main_generate2fa() -> String {
+    generate2fa()
+}
+
+pub fn main_verify2fa(code: String) -> bool {
+    verify2fa(code)
+}
+
+pub fn main_has_valid_2fa_sync() -> SyncReturn<bool> {
+    SyncReturn(has_valid_2fa())
+}
+
+pub fn main_get_hard_option(key: String) -> SyncReturn<String> {
+    SyncReturn(get_hard_option(key))
 }
 
 #[cfg(target_os = "android")]

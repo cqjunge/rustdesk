@@ -13,7 +13,6 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../common.dart';
 import '../consts.dart';
-import './state_model.dart';
 
 /// Mouse button enum.
 enum MouseButtons { left, right, wheel }
@@ -53,15 +52,122 @@ class PointerEventToRust {
   }
 }
 
+class ToReleaseKeys {
+  RawKeyEvent? lastLShiftKeyEvent;
+  RawKeyEvent? lastRShiftKeyEvent;
+  RawKeyEvent? lastLCtrlKeyEvent;
+  RawKeyEvent? lastRCtrlKeyEvent;
+  RawKeyEvent? lastLAltKeyEvent;
+  RawKeyEvent? lastRAltKeyEvent;
+  RawKeyEvent? lastLCommandKeyEvent;
+  RawKeyEvent? lastRCommandKeyEvent;
+  RawKeyEvent? lastSuperKeyEvent;
+
+  reset() {
+    lastLShiftKeyEvent = null;
+    lastRShiftKeyEvent = null;
+    lastLCtrlKeyEvent = null;
+    lastRCtrlKeyEvent = null;
+    lastLAltKeyEvent = null;
+    lastRAltKeyEvent = null;
+    lastLCommandKeyEvent = null;
+    lastRCommandKeyEvent = null;
+    lastSuperKeyEvent = null;
+  }
+
+  updateKeyDown(LogicalKeyboardKey logicKey, RawKeyDownEvent e) {
+    if (e.isAltPressed) {
+      if (logicKey == LogicalKeyboardKey.altLeft) {
+        lastLAltKeyEvent = e;
+      } else if (logicKey == LogicalKeyboardKey.altRight) {
+        lastRAltKeyEvent = e;
+      }
+    } else if (e.isControlPressed) {
+      if (logicKey == LogicalKeyboardKey.controlLeft) {
+        lastLCtrlKeyEvent = e;
+      } else if (logicKey == LogicalKeyboardKey.controlRight) {
+        lastRCtrlKeyEvent = e;
+      }
+    } else if (e.isShiftPressed) {
+      if (logicKey == LogicalKeyboardKey.shiftLeft) {
+        lastLShiftKeyEvent = e;
+      } else if (logicKey == LogicalKeyboardKey.shiftRight) {
+        lastRShiftKeyEvent = e;
+      }
+    } else if (e.isMetaPressed) {
+      if (logicKey == LogicalKeyboardKey.metaLeft) {
+        lastLCommandKeyEvent = e;
+      } else if (logicKey == LogicalKeyboardKey.metaRight) {
+        lastRCommandKeyEvent = e;
+      } else if (logicKey == LogicalKeyboardKey.superKey) {
+        lastSuperKeyEvent = e;
+      }
+    }
+  }
+
+  updateKeyUp(LogicalKeyboardKey logicKey, RawKeyUpEvent e) {
+    if (e.isAltPressed) {
+      if (logicKey == LogicalKeyboardKey.altLeft) {
+        lastLAltKeyEvent = null;
+      } else if (logicKey == LogicalKeyboardKey.altRight) {
+        lastRAltKeyEvent = null;
+      }
+    } else if (e.isControlPressed) {
+      if (logicKey == LogicalKeyboardKey.controlLeft) {
+        lastLCtrlKeyEvent = null;
+      } else if (logicKey == LogicalKeyboardKey.controlRight) {
+        lastRCtrlKeyEvent = null;
+      }
+    } else if (e.isShiftPressed) {
+      if (logicKey == LogicalKeyboardKey.shiftLeft) {
+        lastLShiftKeyEvent = null;
+      } else if (logicKey == LogicalKeyboardKey.shiftRight) {
+        lastRShiftKeyEvent = null;
+      }
+    } else if (e.isMetaPressed) {
+      if (logicKey == LogicalKeyboardKey.metaLeft) {
+        lastLCommandKeyEvent = null;
+      } else if (logicKey == LogicalKeyboardKey.metaRight) {
+        lastRCommandKeyEvent = null;
+      } else if (logicKey == LogicalKeyboardKey.superKey) {
+        lastSuperKeyEvent = null;
+      }
+    }
+  }
+
+  release(KeyEventResult Function(RawKeyEvent e) handleRawKeyEvent) {
+    for (final key in [
+      lastLShiftKeyEvent,
+      lastRShiftKeyEvent,
+      lastLCtrlKeyEvent,
+      lastRCtrlKeyEvent,
+      lastLAltKeyEvent,
+      lastRAltKeyEvent,
+      lastLCommandKeyEvent,
+      lastRCommandKeyEvent,
+      lastSuperKeyEvent,
+    ]) {
+      if (key != null) {
+        handleRawKeyEvent(RawKeyUpEvent(
+          data: key.data,
+          character: key.character,
+        ));
+      }
+    }
+  }
+}
+
 class InputModel {
   final WeakReference<FFI> parent;
-  String keyboardMode = "legacy";
+  String keyboardMode = '';
 
   // keyboard
   var shift = false;
   var ctrl = false;
   var alt = false;
   var command = false;
+
+  final ToReleaseKeys toReleaseKeys = ToReleaseKeys();
 
   // trackpad
   var _trackpadLastDelta = Offset.zero;
@@ -75,6 +181,8 @@ class InputModel {
 
   var _lastScale = 1.0;
 
+  bool _pointerMovedAfterEnter = false;
+
   // mouse
   final isPhysicalMouse = false.obs;
   int _lastButtons = 0;
@@ -85,21 +193,34 @@ class InputModel {
   bool get keyboardPerm => parent.target!.ffiModel.keyboard;
   String get id => parent.target?.id ?? '';
   String? get peerPlatform => parent.target?.ffiModel.pi.platform;
+  bool get isViewOnly => parent.target!.ffiModel.viewOnly;
 
   InputModel(this.parent) {
     sessionId = parent.target!.sessionId;
+
+    // It is ok to call updateKeyboardMode() directly.
+    // Because `bind` is initialized in `PlatformFFI.init()` which is called very early.
+    // But we still wrap it in a Future.delayed() to make it more clear.
+    Future.delayed(Duration(milliseconds: 100), () {
+      updateKeyboardMode();
+    });
   }
 
-  KeyEventResult handleRawKeyEvent(FocusNode data, RawKeyEvent e) {
-    if (isDesktop && !stateGlobal.grabKeyboard) {
-      return KeyEventResult.handled;
-    }
-
+  updateKeyboardMode() async {
     // * Currently mobile does not enable map mode
-    if (isDesktop) {
-      bind.sessionGetKeyboardMode(sessionId: sessionId).then((result) {
-        keyboardMode = result.toString();
-      });
+    if (isDesktop || isWebDesktop) {
+      if (keyboardMode.isEmpty) {
+        keyboardMode =
+            await bind.sessionGetKeyboardMode(sessionId: sessionId) ??
+                kKeyLegacyMode;
+      }
+    }
+  }
+
+  KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
+    if (isViewOnly) return KeyEventResult.handled;
+    if ((isDesktop || isWebDesktop) && !isInputSourceFlutter) {
+      return KeyEventResult.handled;
     }
 
     final key = e.logicalKey;
@@ -115,6 +236,7 @@ class InputModel {
           command = true;
         }
       }
+      toReleaseKeys.updateKeyDown(key, e);
     }
     if (e is RawKeyUpEvent) {
       if (key == LogicalKeyboardKey.altLeft ||
@@ -131,10 +253,12 @@ class InputModel {
           key == LogicalKeyboardKey.superKey) {
         command = false;
       }
+
+      toReleaseKeys.updateKeyUp(key, e);
     }
 
     // * Currently mobile does not enable map mode
-    if (isDesktop && keyboardMode == 'map') {
+    if ((isDesktop || isWebDesktop) && keyboardMode == 'map') {
       mapKeyboardMode(e);
     } else {
       legacyKeyboardMode(e);
@@ -320,12 +444,17 @@ class InputModel {
   }
 
   void enterOrLeave(bool enter) {
+    toReleaseKeys.release(handleRawKeyEvent);
+    _pointerMovedAfterEnter = false;
+
     // Fix status
     if (!enter) {
       resetModifiers();
     }
     _flingTimer?.cancel();
-    bind.sessionEnterOrLeave(sessionId: sessionId, enter: enter);
+    if (!isInputSourceFlutter) {
+      bind.sessionEnterOrLeave(sessionId: sessionId, enter: enter);
+    }
   }
 
   /// Send mouse movement event with distance in [x] and [y].
@@ -340,6 +469,7 @@ class InputModel {
 
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
+    if (isViewOnly) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (!isPhysicalMouse.value) {
       isPhysicalMouse.value = true;
@@ -352,7 +482,7 @@ class InputModel {
   void onPointerPanZoomStart(PointerPanZoomStartEvent e) {
     _lastScale = 1.0;
     _stopFling = true;
-
+    if (isViewOnly) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', 'pan_start', e.position);
     }
@@ -360,6 +490,7 @@ class InputModel {
 
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
+    if (isViewOnly) return;
     if (peerPlatform != kPeerPlatformAndroid) {
       final scale = ((e.scale - _lastScale) * 1000).toInt();
       _lastScale = e.scale;
@@ -396,7 +527,8 @@ class InputModel {
     }
     if (x != 0 || y != 0) {
       if (peerPlatform == kPeerPlatformAndroid) {
-        handlePointerEvent('touch', 'pan_update', Offset(x.toDouble(), y.toDouble()));
+        handlePointerEvent(
+            'touch', 'pan_update', Offset(x.toDouble(), y.toDouble()));
       } else {
         bind.sessionSendMouse(
             sessionId: sessionId,
@@ -484,6 +616,7 @@ class InputModel {
   void onPointDownImage(PointerDownEvent e) {
     debugPrint("onPointDownImage ${e.kind}");
     _stopFling = true;
+    if (isViewOnly) return;
     if (e.kind != ui.PointerDeviceKind.mouse) {
       if (isPhysicalMouse.value) {
         isPhysicalMouse.value = false;
@@ -495,6 +628,7 @@ class InputModel {
   }
 
   void onPointUpImage(PointerUpEvent e) {
+    if (isViewOnly) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isPhysicalMouse.value) {
       handleMouse(_getMouseEvent(e, _kMouseEventUp), e.position);
@@ -502,6 +636,7 @@ class InputModel {
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
+    if (isViewOnly) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isPhysicalMouse.value) {
       handleMouse(_getMouseEvent(e, _kMouseEventMove), e.position);
@@ -509,6 +644,7 @@ class InputModel {
   }
 
   void onPointerSignalImage(PointerSignalEvent e) {
+    if (isViewOnly) return;
     if (e is PointerScrollEvent) {
       var dx = e.scrollDelta.dx.toInt();
       var dy = e.scrollDelta.dy.toInt();
@@ -653,12 +789,19 @@ class InputModel {
         type = 'up';
         break;
       case _kMouseEventMove:
+        _pointerMovedAfterEnter = true;
         isMove = true;
         break;
       default:
         return;
     }
     evt['type'] = type;
+
+    if (type == 'down' && !_pointerMovedAfterEnter) {
+      // Move mouse to the position of the down event first.
+      lastMousePos = ui.Offset(x, y);
+      refreshMousePos();
+    }
 
     final pos = handlePointerDevicePos(
       kPointerEventKindMouse,
@@ -765,9 +908,13 @@ class InputModel {
     }
 
     int minX = rect.left.toInt();
-    int maxX = (rect.left + rect.width).toInt() - 1;
+    // https://github.com/rustdesk/rustdesk/issues/6678
+    // For Windows, [0,maxX], [0,maxY] should be set to enable window snapping.
+    int maxX = (rect.left + rect.width).toInt() -
+        (peerPlatform == kPeerPlatformWindows ? 0 : 1);
     int minY = rect.top.toInt();
-    int maxY = (rect.top + rect.height).toInt() - 1;
+    int maxY = (rect.top + rect.height).toInt() -
+        (peerPlatform == kPeerPlatformWindows ? 0 : 1);
     evtX = trySetNearestRange(evtX, minX, maxX, 5);
     evtY = trySetNearestRange(evtY, minY, maxY, 5);
     if (kind == kPointerEventKindMouse) {

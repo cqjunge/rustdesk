@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:async';
-import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -95,6 +94,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           tabController: tabController,
           switchUuid: params['switch_uuid'],
           forceRelay: params['forceRelay'],
+          isSharedPassword: params['isSharedPassword'],
         ),
       ));
       _update_remote_count();
@@ -126,7 +126,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         tryMoveToScreenAndSetFullscreen(screenRect);
         if (tabController.length == 0) {
           // Show the hidden window.
-          if (Platform.isMacOS && stateGlobal.closeOnFullscreen == true) {
+          if (isMacOS && stateGlobal.closeOnFullscreen == true) {
             stateGlobal.setFullscreen(true);
           }
           // Reset the state
@@ -153,10 +153,11 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
             tabController: tabController,
             switchUuid: switchUuid,
             forceRelay: args['forceRelay'],
+            isSharedPassword: args['isSharedPassword'],
           ),
         ));
       } else if (call.method == kWindowDisableGrabKeyboard) {
-        stateGlobal.grabKeyboard = false;
+        // ???
       } else if (call.method == "onDestroy") {
         tabController.clear();
       } else if (call.method == kWindowActionRebuild) {
@@ -326,7 +327,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         ),
       ),
     );
-    return Platform.isMacOS || kUseCompatibleUiMode
+    return isMacOS || kUseCompatibleUiMode
         ? tabWidget
         : Obx(() => SubWindowDragToResizeArea(
               key: contentKey,
@@ -386,7 +387,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
             pi.platform == kPeerPlatformMacOS)) {
       menu.add(MenuEntryButton<String>(
         childBuilder: (TextStyle? style) => Text(
-          translate('Restart Remote Device'),
+          translate('Restart remote device'),
           style: style,
         ),
         proc: () => showRestartRemoteDevice(

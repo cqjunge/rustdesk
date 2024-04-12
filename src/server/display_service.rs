@@ -12,6 +12,7 @@ use scrap::Display;
 
 pub const NAME: &'static str = "display";
 
+#[cfg(all(windows, feature = "virtual_display_driver"))]
 const DUMMY_DISPLAY_SIDE_MAX_SIZE: usize = 1024;
 
 struct ChangedResolution {
@@ -23,7 +24,7 @@ lazy_static::lazy_static! {
     static ref IS_CAPTURER_MAGNIFIER_SUPPORTED: bool = is_capturer_mag_supported();
     static ref CHANGED_RESOLUTIONS: Arc<RwLock<HashMap<String, ChangedResolution>>> = Default::default();
     // Initial primary display index.
-    // It should only be updated when the rustdesk server is started, and should not be updated when displays changed.
+    // It should not be updated when displays changed.
     pub static ref PRIMARY_DISPLAY_IDX: usize = get_primary();
     static ref SYNC_DISPLAYS: Arc<Mutex<SyncDisplaysInfo>> = Default::default();
 }
@@ -79,8 +80,8 @@ pub(super) fn check_display_changed(
     let lock = SYNC_DISPLAYS.lock().unwrap();
     // If plugging out a monitor && lock.displays.get(idx) is None.
     //  1. The client version < 1.2.4. The client side has to reconnect.
-    //  2. The client version > 1.2.4, The client side can handle the case becuase sync peer info message will be sent.
-    // But it is acceptable to for the user to reconnect manually, becuase the monitor is unplugged.
+    //  2. The client version > 1.2.4, The client side can handle the case because sync peer info message will be sent.
+    // But it is acceptable to for the user to reconnect manually, because the monitor is unplugged.
     let d = lock.displays.get(idx)?;
     if ndisplay != lock.displays.len() {
         return Some(d.clone());
@@ -121,6 +122,8 @@ pub fn reset_resolutions() {
             );
         }
     }
+    // Can be cleared because reset resolutions is called when there is no client connected.
+    CHANGED_RESOLUTIONS.write().unwrap().clear();
 }
 
 #[inline]
@@ -137,12 +140,10 @@ pub fn capture_cursor_embedded() -> bool {
 }
 
 #[inline]
-pub fn is_privacy_mode_supported() -> bool {
-    #[cfg(windows)]
+#[cfg(windows)]
+pub fn is_privacy_mode_mag_supported() -> bool {
     return *IS_CAPTURER_MAGNIFIER_SUPPORTED
         && get_version_number(&crate::VERSION) > get_version_number("1.1.9");
-    #[cfg(not(windows))]
-    return false;
 }
 
 pub fn new() -> GenericService {
@@ -179,7 +180,22 @@ fn displays_to_msg(displays: Vec<DisplayInfo>) -> Message {
 }
 
 fn check_get_displays_changed_msg() -> Option<Message> {
+    #[cfg(target_os = "linux")]
+    {
+        if !is_x11() {
+            return get_displays_msg();
+        }
+    }
     check_update_displays(&try_get_displays().ok()?);
+    get_displays_msg()
+}
+
+pub fn check_displays_changed() -> ResultType<()> {
+    check_update_displays(&try_get_displays()?);
+    Ok(())
+}
+
+fn get_displays_msg() -> Option<Message> {
     let displays = SYNC_DISPLAYS.lock().unwrap().get_update_sync_displays()?;
     Some(displays_to_msg(displays))
 }
@@ -221,9 +237,13 @@ pub(super) fn get_original_resolution(
             ..Default::default()
         }
     } else {
-        let mut changed_resolutions = CHANGED_RESOLUTIONS.write().unwrap();
+        let changed_resolutions = CHANGED_RESOLUTIONS.write().unwrap();
         let (width, height) = match changed_resolutions.get(display_name) {
             Some(res) => {
+                res.original
+                /*
+                The resolution change may not happen immediately, `changed` has been updated,
+                but the actual resolution is old, it will be mistaken for a third-party change.
                 if res.changed.0 != w as i32 || res.changed.1 != h as i32 {
                     // If the resolution is changed by third process, remove the record in changed_resolutions.
                     changed_resolutions.remove(display_name);
@@ -231,6 +251,7 @@ pub(super) fn get_original_resolution(
                 } else {
                     res.original
                 }
+                */
             }
             None => (w as _, h as _),
         };
@@ -259,7 +280,18 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
         .iter()
         .map(|d| {
             let display_name = d.name();
-            let original_resolution = get_original_resolution(&display_name, d.width(), d.height());
+            #[allow(unused_assignments)]
+            #[allow(unused_mut)]
+            let mut scale = 1.0;
+            #[cfg(target_os = "macos")]
+            {
+                scale = d.scale();
+            }
+            let original_resolution = get_original_resolution(
+                &display_name,
+                ((d.width() as f64) / scale).round() as usize,
+                (d.height() as f64 / scale).round() as usize,
+            );
             DisplayInfo {
                 x: d.origin().0 as _,
                 y: d.origin().1 as _,
@@ -269,6 +301,7 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
                 online: d.is_online(),
                 cursor_embedded: false,
                 original_resolution,
+                scale,
                 ..Default::default()
             }
         })
@@ -349,7 +382,10 @@ pub fn try_get_displays() -> ResultType<Vec<Display>> {
 #[cfg(all(windows, feature = "virtual_display_driver"))]
 pub fn try_get_displays() -> ResultType<Vec<Display>> {
     let mut displays = Display::all()?;
-    if no_displays(&displays) {
+    if crate::platform::is_installed()
+        && no_displays(&displays)
+        && virtual_display_manager::is_virtual_display_supported()
+    {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
             log::error!("plug in headless failed {}", e);
